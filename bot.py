@@ -102,4 +102,95 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         voice_file = await context.bot.get_file(voice.file_id)
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            voice_path = os.path.join(tmp
+            voice_path = os.path.join(tmpdir, "voice.ogg")
+            await voice_file.download_to_drive(voice_path)
+
+            try:
+                import speech_recognition as sr
+                from pydub import AudioSegment
+
+                # Convert ogg to wav
+                wav_path = os.path.join(tmpdir, "voice.wav")
+                audio = AudioSegment.from_ogg(voice_path)
+                audio.export(wav_path, format="wav")
+
+                # Recognize speech using Google
+                recognizer = sr.Recognizer()
+                with sr.AudioFile(wav_path) as source:
+                    audio_data = recognizer.record(source)
+                    song_name = recognizer.recognize_google(audio_data)
+
+                await update.message.reply_text(f"🔍 I heard: {song_name}\nSearching...")
+                await download_music(update, song_name)
+
+            except ImportError:
+                await update.message.reply_text(
+                    "⚠️ Voice recognition is not available.\n\n"
+                    "Please type the song name instead:\n"
+                    "Example: /music Shape of You Ed Sheeran"
+                )
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Could not process voice message:\n{str(e)}")
+
+
+# ─────────────────────────────────────────
+# Core music download function
+# ─────────────────────────────────────────
+async def download_music(update: Update, song_name: str):
+    await update.message.reply_text(f"🎵 Searching for: {song_name}\n⏳ Please wait...")
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ydl_opts = {
+                'format': 'bestaudio/best',
+                'outtmpl': os.path.join(tmpdir, '%(title)s.%(ext)s'),
+                'quiet': True,
+                'default_search': 'ytsearch1',
+                'postprocessors': [{
+                    'key': 'FFmpegExtractAudio',
+                    'preferredcodec': 'mp3',
+                    'preferredquality': '192',
+                }],
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(song_name, download=True)
+                if 'entries' in info:
+                    title = info['entries'][0].get('title', song_name)
+                else:
+                    title = info.get('title', song_name)
+
+            for file in os.listdir(tmpdir):
+                if file.endswith('.mp3'):
+                    file_path = os.path.join(tmpdir, file)
+                    await update.message.reply_audio(
+                        audio=open(file_path, 'rb'),
+                        title=title,
+                        caption=f"🎵 {title}"
+                    )
+                    return
+
+            await update.message.reply_text("❌ Could not find that song. Try a different name.")
+
+    except Exception as e:
+        await update.message.reply_text(f"❌ Music download failed:\n{str(e)}")
+
+
+# ─────────────────────────────────────────
+# Start the bot
+# ─────────────────────────────────────────
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("music", music_command))
+    app.add_handler(MessageHandler(filters.VOICE, handle_voice))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("✅ Bot is running! Press Ctrl+C to stop.")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
