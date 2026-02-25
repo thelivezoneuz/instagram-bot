@@ -22,6 +22,10 @@ HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
 }
 
+# We store search results temporarily here
+# Key = user_id, Value = list of results
+search_cache = {}
+
 
 # ─────────────────────────────────────────
 # /start command
@@ -57,7 +61,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await download_instagram(update, url)
         return
 
-    # Otherwise treat as music search — first ask which platform
+    # Otherwise treat as music search
     await ask_platform(update, context, text)
 
 
@@ -82,31 +86,20 @@ async def ask_platform(update: Update, context: ContextTypes.DEFAULT_TYPE, song_
 
 
 # ─────────────────────────────────────────
-# Search music on chosen platform
+# Search music and show results as buttons
 # ─────────────────────────────────────────
-async def search_music(update_or_query, song_name: str, platform: str, is_query: bool = False):
+async def search_music(query, song_name: str, platform: str):
+    platform_name = 'YouTube' if platform == 'yt' else 'SoundCloud'
+    source_label = '🎬' if platform == 'yt' else '☁️'
 
-    if is_query:
-        await update_or_query.edit_message_text(
-            f"🔍 Searching on {'YouTube' if platform == 'yt' else 'SoundCloud'} for: {song_name}\n⏳ Please wait..."
-        )
-        reply_func = update_or_query.message.reply_text
-    else:
-        await update_or_query.message.reply_text(
-            f"🔍 Searching on {'YouTube' if platform == 'yt' else 'SoundCloud'} for: {song_name}\n⏳ Please wait..."
-        )
-        reply_func = update_or_query.message.reply_text
+    await query.edit_message_text(
+        f"🔍 Searching on {platform_name} for: {song_name}\n⏳ Please wait..."
+    )
 
     try:
         results = []
 
-        # Choose search prefix based on platform
-        if platform == 'yt':
-            search_query = f'ytsearch5:{song_name}'
-            source_label = '🎬 YT'
-        else:
-            search_query = f'scsearch5:{song_name}'
-            source_label = '☁️ SC'
+        search_query = f'ytsearch5:{song_name}' if platform == 'yt' else f'scsearch5:{song_name}'
 
         ydl_opts = {
             'quiet': True,
@@ -122,9 +115,9 @@ async def search_music(update_or_query, song_name: str, platform: str, is_query:
                 for entry in info['entries']:
                     if entry:
                         title = entry.get('title', 'Unknown')
-                        video_id = entry.get('id', '')
                         duration_sec = entry.get('duration', 0)
-                        url = entry.get('url') or entry.get('webpage_url', '')
+                        # ✅ Always get the full webpage URL
+                        full_url = entry.get('webpage_url') or entry.get('url', '')
 
                         # Format duration
                         if duration_sec:
@@ -134,33 +127,35 @@ async def search_music(update_or_query, song_name: str, platform: str, is_query:
                         else:
                             duration = "?"
 
-                        if video_id or url:
+                        if full_url:
                             results.append({
                                 'title': title,
-                                'id': video_id,
-                                'url': url,
+                                'url': full_url,
                                 'duration': duration,
-                                'platform': platform
                             })
 
         if not results:
-            await reply_func("❌ No results found. Try a different song name.")
+            await query.edit_message_text(
+                f"❌ No results found on {platform_name}.\n\nTry the other platform or a different song name."
+            )
             return
 
-        # Build result buttons
+        # ✅ Save results in cache using user id
+        user_id = query.from_user.id
+        search_cache[user_id] = results
+
+        # Build result buttons using index (to avoid URL issues in callback_data)
         keyboard = []
         for i, result in enumerate(results):
             label = f"{i+1}. {source_label} {result['title']} [{result['duration']}]"
             if len(label) > 64:
                 label = label[:61] + "..."
+            # Use index number in callback — safe and short
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"pick_{i}")])
 
-            # Store platform + id in callback
-            callback = f"dl_{platform}_{result['id']}"
-            keyboard.append([InlineKeyboardButton(label, callback_data=callback)])
-
-        # Add search on other platform option
+        # Switch platform option
         other_platform = 'sc' if platform == 'yt' else 'yt'
-        other_label = '☁️ Search on SoundCloud instead' if platform == 'yt' else '🎬 Search on YouTube instead'
+        other_label = '☁️ Try SoundCloud instead' if platform == 'yt' else '🎬 Try YouTube instead'
         keyboard.append([
             InlineKeyboardButton(other_label, callback_data=f"platform_{other_platform}_{song_name}")
         ])
@@ -168,14 +163,14 @@ async def search_music(update_or_query, song_name: str, platform: str, is_query:
 
         reply_markup = InlineKeyboardMarkup(keyboard)
 
-        await reply_func(
+        await query.edit_message_text(
             f"🎵 Found {len(results)} results for: *{song_name}*\n\nPick one to download:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
 
     except Exception as e:
-        await reply_func(f"❌ Search failed. Please try again.\nError: {str(e)}")
+        await query.edit_message_text(f"❌ Search failed. Please try again.\nError: {str(e)}")
 
 
 # ─────────────────────────────────────────
@@ -184,7 +179,6 @@ async def search_music(update_or_query, song_name: str, platform: str, is_query:
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     data = query.data
 
     # ── Cancel ──
@@ -192,29 +186,31 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text("❌ Cancelled.")
         return
 
-    # ── Platform chosen — search on that platform ──
-    # Format: platform_yt_song name  OR  platform_sc_song name
+    # ── Platform chosen ──
+    # Format: platform_yt_song name OR platform_sc_song name
     if data.startswith("platform_"):
-        parts = data.split("_", 2)   # ["platform", "yt", "song name"]
-        platform = parts[1]          # "yt" or "sc"
-        song_name = parts[2]         # "song name"
-        await search_music(query, song_name, platform, is_query=True)
+        parts = data.split("_", 2)
+        platform = parts[1]
+        song_name = parts[2]
+        await search_music(query, song_name, platform)
         return
 
-    # ── Download chosen ──
-    # Format: dl_yt_videoid  OR  dl_sc_videoid
-    if data.startswith("dl_"):
-        parts = data.split("_", 2)   # ["dl", "yt", "videoid"]
-        platform = parts[1]          # "yt" or "sc"
-        video_id = parts[2]          # video id
+    # ── User picked a result by index ──
+    # Format: pick_0, pick_1, pick_2 etc.
+    if data.startswith("pick_"):
+        index = int(data.split("_")[1])
+        user_id = query.from_user.id
 
-        # Build the full URL
-        if platform == 'yt':
-            media_url = f"https://www.youtube.com/watch?v={video_id}"
-        else:
-            media_url = f"https://soundcloud.com/{video_id}" if '/' in video_id else video_id
+        # Get URL from cache
+        if user_id not in search_cache or index >= len(search_cache[user_id]):
+            await query.edit_message_text("❌ Session expired. Please search again.")
+            return
 
-        await query.edit_message_text("⏳ Downloading your song... please wait.")
+        result = search_cache[user_id][index]
+        media_url = result['url']
+        title = result['title']
+
+        await query.edit_message_text(f"⏳ Downloading: {title}\nPlease wait...")
 
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
@@ -233,7 +229,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(media_url, download=True)
-                    title = info.get('title', 'Unknown')
+                    title = info.get('title', title)
 
                 for file in os.listdir(tmpdir):
                     if file.endswith('.mp3'):
@@ -309,7 +305,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     song_name = recognizer.recognize_google(audio_data)
 
                 await update.message.reply_text(f"🔍 I heard: {song_name}")
-                await ask_platform(update, context, song_name)
+                await ask_platform(update, None, song_name)
 
             except ImportError:
                 await update.message.reply_text(
