@@ -27,7 +27,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📸 Instagram Downloader:\n"
         "Send any Instagram link → I'll download it\n\n"
         "🎵 Music Search:\n"
-        "Just type any song name → I'll show you options to pick from\n"
+        "Just type any song name → I'll show you 5 options\n"
         "Example: Shape of You\n"
         "Example: Blinding Lights The Weeknd\n\n"
         "🎤 Voice Search:\n"
@@ -37,12 +37,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─────────────────────────────────────────
 # Handle all text messages
-# Detects: Instagram links OR song name search
 # ─────────────────────────────────────────
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # ── Check if it's an Instagram link ──
+    # Check if it's an Instagram link
     match = re.search(INSTAGRAM_REGEX, text)
     if match:
         url = match.group(0)
@@ -50,12 +49,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await download_instagram(update, url)
         return
 
-    # ── Otherwise treat it as a music search ──
+    # Otherwise treat as music search
     await search_music(update, context, text)
 
 
 # ─────────────────────────────────────────
-# Search music and show 5 results as buttons
+# Search music — shows 5 results as buttons
 # ─────────────────────────────────────────
 async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE, song_name: str):
     await update.message.reply_text(f"🔍 Searching for: {song_name}\n⏳ Please wait...")
@@ -65,14 +64,20 @@ async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE, song_
 
         ydl_opts = {
             'quiet': True,
-            'extract_flat': True,        # Don't download, just get info
-            'default_search': 'ytsearch5',  # Get top 5 YouTube results
+            'no_warnings': True,
+            'extract_flat': 'in_playlist',
+            'default_search': f'ytsearch5:{song_name}',
+            # These headers make yt-dlp look like a real browser
+            'http_headers': {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept-Language': 'en-US,en;q=0.9',
+            },
         }
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(song_name, download=False)
+            info = ydl.extract_info(f'ytsearch5:{song_name}', download=False)
 
-            if 'entries' in info:
+            if info and 'entries' in info:
                 for entry in info['entries']:
                     if entry:
                         title = entry.get('title', 'Unknown')
@@ -87,28 +92,31 @@ async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE, song_
                         else:
                             duration = "?"
 
-                        results.append({
-                            'title': title,
-                            'id': video_id,
-                            'duration': duration
-                        })
+                        if video_id:
+                            results.append({
+                                'title': title,
+                                'id': video_id,
+                                'duration': duration
+                            })
 
         if not results:
-            await update.message.reply_text("❌ No results found. Try a different song name.")
+            await update.message.reply_text(
+                "❌ No results found.\n\n"
+                "Please try again with a different song name."
+            )
             return
 
         # Build inline buttons — one per result
         keyboard = []
         for i, result in enumerate(results):
             label = f"{i+1}. 🎵 {result['title']} [{result['duration']}]"
-            # Truncate long titles so button fits
-            if len(label) > 60:
-                label = label[:57] + "..."
+            if len(label) > 64:
+                label = label[:61] + "..."
             keyboard.append([
                 InlineKeyboardButton(label, callback_data=f"dl_{result['id']}")
             ])
 
-        # Add a cancel button at the bottom
+        # Cancel button
         keyboard.append([
             InlineKeyboardButton("❌ Cancel", callback_data="cancel")
         ])
@@ -122,24 +130,26 @@ async def search_music(update: Update, context: ContextTypes.DEFAULT_TYPE, song_
         )
 
     except Exception as e:
-        await update.message.reply_text(f"❌ Search failed:\n{str(e)}")
+        await update.message.reply_text(
+            f"❌ Search failed. Please try again.\n\nError: {str(e)}"
+        )
 
 
 # ─────────────────────────────────────────
-# Handle button clicks (when user picks a song)
+# Handle button clicks (user picks a song)
 # ─────────────────────────────────────────
 async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()  # Remove the loading spinner on the button
+    await query.answer()
 
     # User clicked Cancel
     if query.data == "cancel":
         await query.edit_message_text("❌ Search cancelled.")
         return
 
-    # User picked a song — extract the YouTube video ID
+    # User picked a song
     if query.data.startswith("dl_"):
-        video_id = query.data[3:]  # Remove "dl_" prefix
+        video_id = query.data[3:]
         youtube_url = f"https://www.youtube.com/watch?v={video_id}"
 
         await query.edit_message_text("⏳ Downloading your song... please wait.")
@@ -150,6 +160,10 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     'format': 'bestaudio/best',
                     'outtmpl': os.path.join(tmpdir, '%(title)s.%(ext)s'),
                     'quiet': True,
+                    'no_warnings': True,
+                    'http_headers': {
+                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                    },
                     'postprocessors': [{
                         'key': 'FFmpegExtractAudio',
                         'preferredcodec': 'mp3',
