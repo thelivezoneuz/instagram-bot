@@ -14,8 +14,6 @@ from telegram.ext import (
 # Load your secret token from the .env file
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# OMDB API key — free movie database (get yours at omdbapi.com)
 OMDB_API_KEY = os.getenv("OMDB_API_KEY", "trilogy")
 
 # Instagram link pattern
@@ -28,11 +26,11 @@ HEADERS = {
 }
 
 # Memory caches
-search_cache = {}       # music search results
-last_download = {}      # last downloaded song per user
-movie_cache = {}        # movie search results per user
+search_cache = {}
+last_download = {}
+movie_cache = {}
+movie_search_cache = {}   # YouTube search results for movie download
 
-# Favourites file
 FAVOURITES_FILE = "favourites.json"
 
 
@@ -85,7 +83,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Type a song name → pick & download\n"
         "Example: Blinding Lights\n\n"
         "🎬 MOVIES & SERIES\n"
-        "Type /movie <name> → get info & links\n"
+        "Type /movie <name> → info + download\n"
         "Example: /movie Inception\n"
         "Example: /movie Breaking Bad\n\n"
         "⭐ FAVOURITES\n"
@@ -97,7 +95,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ─────────────────────────────────────────
-# /movie command — search films & series
+# /movie command
 # ─────────────────────────────────────────
 async def movie_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -118,20 +116,17 @@ async def search_movie(update, query_text: str):
     msg = await update.message.reply_text(f"🔍 Searching for: {query_text}\n⏳ Please wait...")
 
     try:
-        # Search OMDB for movies/series
         response = requests.get(
-            f"http://www.omdbapi.com/?s={query_text}&apikey={OMDB_API_KEY}&type=",
+            f"http://www.omdbapi.com/?s={query_text}&apikey={OMDB_API_KEY}",
             timeout=10
         )
         data = response.json()
 
         if data.get('Response') == 'False' or 'Search' not in data:
-            await msg.edit_text(
-                f"❌ No results found for: {query_text}\n\nTry a different name."
-            )
+            await msg.edit_text(f"❌ No results found for: {query_text}\n\nTry a different name.")
             return
 
-        results = data['Search'][:8]  # Show max 8 results
+        results = data['Search'][:8]
         user_id = str(update.effective_user.id)
         movie_cache[user_id] = results
 
@@ -150,7 +145,7 @@ async def search_movie(update, query_text: str):
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await msg.edit_text(
-            f"🎬 Found {len(results)} results for: *{query_text}*\n\nPick one for details:",
+            f"🎬 Found {len(results)} results for: *{query_text}*\n\nPick one:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
@@ -159,7 +154,10 @@ async def search_movie(update, query_text: str):
         await msg.edit_text(f"❌ Search failed:\n{str(e)}")
 
 
-async def show_movie_details(query, imdb_id: str):
+# ─────────────────────────────────────────
+# Show movie details + download button
+# ─────────────────────────────────────────
+async def show_movie_details(query, imdb_id: str, user_id: str):
     await query.edit_message_text("⏳ Loading details...")
 
     try:
@@ -184,9 +182,7 @@ async def show_movie_details(query, imdb_id: str):
         media_type = data.get('Type', 'movie')
         total_seasons = data.get('totalSeasons', '')
         language = data.get('Language', '?')
-        awards = data.get('Awards', '')
 
-        # Build info message
         emoji = '🎬' if media_type == 'movie' else '📺'
         seasons_text = f"\n📅 Seasons: {total_seasons}" if total_seasons else ""
 
@@ -204,38 +200,156 @@ async def show_movie_details(query, imdb_id: str):
             f"📖 {plot}\n"
         )
 
-        if awards and awards != 'N/A':
-            info += f"━━━━━━━━━━━━━━━\n🏆 {awards}\n"
+        # Save movie title+year for download search
+        movie_cache[f"detail_{user_id}"] = {
+            'title': title,
+            'year': year,
+            'type': media_type
+        }
 
-        # Build watch links buttons
         keyboard = [
-            [
-                InlineKeyboardButton("▶️ Watch on YouTube", url=f"https://www.youtube.com/results?search_query={title}+{year}+full+movie"),
-            ],
-            [
-                InlineKeyboardButton("🔍 Search on Google", url=f"https://www.google.com/search?q=watch+{title}+{year}+online+free"),
-            ],
-            [
-                InlineKeyboardButton("📊 IMDb Page", url=f"https://www.imdb.com/title/{imdb_id}"),
-            ],
-            [InlineKeyboardButton("🔙 Back to results", callback_data="mvback")],
+            [InlineKeyboardButton("📥 Download MP4", callback_data="mvdl")],
+            [InlineKeyboardButton("🎞 Watch Trailer", url=f"https://www.youtube.com/results?search_query={title}+{year}+official+trailer")],
+            [InlineKeyboardButton("📊 IMDb Page", url=f"https://www.imdb.com/title/{imdb_id}")],
+            [InlineKeyboardButton("🔙 Back", callback_data="mvback")],
         ]
 
-        # Add trailer button
-        keyboard.insert(0, [
-            InlineKeyboardButton("🎞 Watch Trailer", url=f"https://www.youtube.com/results?search_query={title}+{year}+official+trailer"),
-        ])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await query.edit_message_text(info, reply_markup=reply_markup, parse_mode='Markdown')
 
+    except Exception as e:
+        await query.edit_message_text(f"❌ Failed to load details:\n{str(e)}")
+
+
+# ─────────────────────────────────────────
+# Search YouTube for movie and show options
+# ─────────────────────────────────────────
+async def search_movie_on_youtube(query, title: str, year: str, user_id: str):
+    await query.edit_message_text(f"🔍 Searching YouTube for: {title} ({year})\n⏳ Please wait...")
+
+    try:
+        search_terms = [
+            f"{title} {year} full movie",
+            f"{title} full movie english",
+            f"{title} {year}",
+        ]
+
+        results = []
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': 'in_playlist',
+            'http_headers': HEADERS,
+        }
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(f'ytsearch6:{title} {year} full movie', download=False)
+            if info and 'entries' in info:
+                for entry in info['entries']:
+                    if entry:
+                        v_title = entry.get('title', 'Unknown')
+                        duration_sec = entry.get('duration', 0)
+                        full_url = entry.get('webpage_url') or entry.get('url', '')
+                        if duration_sec:
+                            mins = int(duration_sec) // 60
+                            secs = int(duration_sec) % 60
+                            duration = f"{mins}:{secs:02d}"
+                        else:
+                            duration = "?"
+                        if full_url:
+                            results.append({
+                                'title': v_title,
+                                'url': full_url,
+                                'duration': duration
+                            })
+
+        if not results:
+            await query.edit_message_text(
+                f"❌ Could not find *{title}* on YouTube.\n\n"
+                "The movie may not be available for free online.",
+                parse_mode='Markdown'
+            )
+            return
+
+        # Save results in cache
+        movie_search_cache[user_id] = results
+
+        keyboard = []
+        for i, result in enumerate(results):
+            label = f"{i+1}. 🎬 {result['title']} [{result['duration']}]"
+            if len(label) > 64:
+                label = label[:61] + "..."
+            keyboard.append([InlineKeyboardButton(label, callback_data=f"mvpick{i}")])
+
+        keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
         reply_markup = InlineKeyboardMarkup(keyboard)
 
         await query.edit_message_text(
-            info,
+            f"🎬 Found {len(results)} results for: *{title}*\n\n"
+            "⚠️ Pick the correct full movie version:",
             reply_markup=reply_markup,
             parse_mode='Markdown'
         )
 
     except Exception as e:
-        await query.edit_message_text(f"❌ Failed to load details:\n{str(e)}")
+        await query.edit_message_text(f"❌ Search failed:\n{str(e)}")
+
+
+# ─────────────────────────────────────────
+# Download movie and send as MP4
+# ─────────────────────────────────────────
+async def download_movie(query, media_url: str, title: str):
+    await query.edit_message_text(
+        f"⏳ Downloading: {title}\n\n"
+        "⚠️ This may take several minutes depending on file size.\n"
+        "Please be patient..."
+    )
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            ydl_opts = {
+                # Download best quality but limit to 480p to keep file size manageable
+                'format': 'bestvideo[height<=480]+bestaudio/best[height<=480]/best',
+                'outtmpl': os.path.join(tmpdir, '%(title)s.%(ext)s'),
+                'quiet': True,
+                'no_warnings': True,
+                'http_headers': HEADERS,
+                'merge_output_format': 'mp4',
+            }
+
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(media_url, download=True)
+                actual_title = info.get('title', title)
+
+            # Find the mp4 file
+            for file in os.listdir(tmpdir):
+                if file.endswith('.mp4') or file.endswith('.mkv') or file.endswith('.webm'):
+                    file_path = os.path.join(tmpdir, file)
+                    file_size_mb = os.path.getsize(file_path) / (1024 * 1024)
+
+                    # Telegram bot limit is 50MB
+                    if file_size_mb > 49:
+                        await query.edit_message_text(
+                            f"❌ File is too large ({file_size_mb:.0f}MB).\n\n"
+                            "Telegram bots can only send files up to 50MB.\n"
+                            "Try a shorter video or lower quality version."
+                        )
+                        return
+
+                    await query.edit_message_text(f"📤 Uploading: {actual_title}\n⏳ Please wait...")
+
+                    await query.message.reply_video(
+                        video=open(file_path, 'rb'),
+                        caption=f"🎬 {actual_title}",
+                        supports_streaming=True
+                    )
+                    await query.edit_message_text(f"✅ Done: {actual_title}")
+                    return
+
+        await query.edit_message_text("❌ Download failed. File not found.")
+
+    except Exception as e:
+        await query.edit_message_text(f"❌ Download failed:\n{str(e)}")
 
 
 # ─────────────────────────────────────────
@@ -281,7 +395,6 @@ async def show_favourites_menu(message, user_id: str, favs: list, edit: bool = F
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
 
-    # Instagram link
     match = re.search(INSTAGRAM_REGEX, text)
     if match:
         url = match.group(0)
@@ -289,7 +402,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await download_instagram(update, url)
         return
 
-    # Otherwise music search
     await ask_platform(update, text)
 
 
@@ -504,17 +616,35 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_favourites_menu(query, user_id, favs, edit=True)
         return
 
-    # ── Movie result picked ──
-    if data.startswith("mv") and not data.startswith("mvback"):
+    # ── Movie result picked from OMDB list ──
+    if data.startswith("mv") and not data.startswith("mvback") and not data.startswith("mvdl") and not data.startswith("mvpick"):
         index = int(data[2:])
         if user_id not in movie_cache or index >= len(movie_cache[user_id]):
             await query.edit_message_text("❌ Session expired. Please search again.")
             return
         item = movie_cache[user_id][index]
         imdb_id = item.get('imdbID', '')
-        # Save last search for back button
         movie_cache[f"last_{user_id}"] = movie_cache[user_id]
-        await show_movie_details(query, imdb_id)
+        await show_movie_details(query, imdb_id, user_id)
+        return
+
+    # ── Download movie button ──
+    if data == "mvdl":
+        detail = movie_cache.get(f"detail_{user_id}")
+        if not detail:
+            await query.edit_message_text("❌ Session expired. Please search again.")
+            return
+        await search_movie_on_youtube(query, detail['title'], detail['year'], user_id)
+        return
+
+    # ── Movie YouTube result picked ──
+    if data.startswith("mvpick"):
+        index = int(data[6:])
+        if user_id not in movie_search_cache or index >= len(movie_search_cache[user_id]):
+            await query.edit_message_text("❌ Session expired. Please search again.")
+            return
+        result = movie_search_cache[user_id][index]
+        await download_movie(query, result['url'], result['title'])
         return
 
     # ── Back to movie results ──
@@ -535,10 +665,7 @@ async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             keyboard.append([InlineKeyboardButton(label, callback_data=f"mv{i}")])
         keyboard.append([InlineKeyboardButton("❌ Cancel", callback_data="cancel")])
         reply_markup = InlineKeyboardMarkup(keyboard)
-        await query.edit_message_text(
-            "🎬 Pick a movie or series:",
-            reply_markup=reply_markup
-        )
+        await query.edit_message_text("🎬 Pick a movie or series:", reply_markup=reply_markup)
         return
 
 
