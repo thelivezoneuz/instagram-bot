@@ -4,3 +4,4 @@ python-dotenv
 SpeechRecognition
 pydub
 ffmpeg-python
+requests
